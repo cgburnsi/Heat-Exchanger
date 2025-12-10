@@ -1,82 +1,85 @@
-# builders.py
-from utils import convert as cv
+# src/builders.py
 from src.assembly import HeatExchanger
+from src.zones import PipeFlowZone, PlateFinZone, TubeBankZone
 from src.fluids import FluidStream
-from src.zones import PipeFlowZone, TubeBankZone, PlateFinZone
 
-_ZONE_REGISTRY = {}
+class HXBuilder:
+    """
+    Production Builder: Converts configuration dictionaries into a HeatExchanger assembly.
+    
+    IMPORTANT: This builder assumes ALL geometry values in the config dictionaries
+    are already converted to Base Units (Meters) before being passed in.
+    """
+    def __init__(self, name, physics_model):
+        self.name = name
+        self.model = physics_model
+        self.zones = []
+        
+        self._creators = {
+            'pipe':   self._add_pipe,
+            'bare':   self._add_bare,
+            'finned': self._add_finned
+        }
 
-def register_zone(kind):
-    def deco(fn):
-        _ZONE_REGISTRY[kind] = fn
-        return fn
-    return deco
+    def add_zones_from_config(self, config_list):
+        for cfg in config_list:
+            z_type = cfg.get('type', 'bare').lower()
+            name = cfg.get('name', f"Zone_{len(self.zones)}")
+            
+            creator = self._creators.get(z_type)
+            if creator:
+                creator(name, cfg)
+            else:
+                raise ValueError(f"Unknown zone type: {z_type}")
+        return self
 
-def _req(cfg, key):
-    if key not in cfg:
-        raise KeyError(f"Missing required key '{key}' in zone config: {cfg}")
-    return cfg[key]
+    def _add_pipe(self, name, cfg):
+        # Expects: 'length', 'diameter' (in meters)
+        self.zones.append(PipeFlowZone(
+            name,
+            length=cfg['length'],
+            diameter=cfg['diameter'],
+            roughness=cfg.get('roughness', 15e-6)
+        ))
 
-def _in_to_m(x):  # tiny unit adapter keeps cv.convert out of your business logic
-    return cv.convert(x, "in", "m")
+    def _add_bare(self, name, cfg):
+        # Expects: 'width', 'height', 'tube_od' (in meters)
+        zone = TubeBankZone(
+            name=name,
+            height=cfg.get('height', cfg['width']), # Default to square if height missing
+            width=cfg['width'],
+            tube_dia=cfg['tube_od'],
+            R_p=cfg.get('Rp', 1.5),
+            n_cols=int(cfg['tubes_deep']),
+            stagger=cfg.get('stagger', True),
+            model=self.model
+        )
+        # Explicit Geometry Overrides (in meters)
+        if 'S_T' in cfg: zone.S_T = cfg['S_T']
+        if 'S_L' in cfg: zone.S_L = cfg['S_L']
+        
+        self.zones.append(zone)
 
-@register_zone("pipe")
-def make_pipe(name, cfg, model):
-    return PipeFlowZone(
-        name,
-        length=_in_to_m(_req(cfg, "length_in")),
-        diameter=_in_to_m(_req(cfg, "diameter_in")),
-        roughness=cfg.get("roughness", 15e-6),
-    )
+    def _add_finned(self, name, cfg):
+        # Expects: 'fin_pitch', 'fin_thickness' (in meters)
+        
+        # Helper: Calculate height from width if not provided (Square Duct assumption)
+        height = cfg.get('height', cfg['width'])
+        
+        self.zones.append(PlateFinZone(
+            name=name,
+            height=height,
+            width=cfg['width'],
+            tube_dia=cfg['tube_od'],
+            R_p=cfg.get('Rp', 2.0),
+            n_cols=int(cfg['tubes_deep']),
+            fin_pitch=cfg['fin_pitch'],
+            fin_thickness=cfg['fin_thickness'],
+            stagger=cfg.get('stagger', True),
+            model=self.model
+        ))
 
-@register_zone("bare")
-def make_bare(name, cfg, model):
-    zone = TubeBankZone(
-        name=name,
-        height=_in_to_m(_req(cfg, "width_in")),   # (see note below)
-        width=_in_to_m(_req(cfg, "width_in")),
-        tube_dia=_in_to_m(_req(cfg, "tube_od_in")),
-        R_p=cfg.get("Rp", 1.5),
-        n_cols=int(_req(cfg, "tubes_deep")),
-        stagger=cfg.get("stagger", True),
-        model=model,
-    )
-    if "S_T_in" in cfg: zone.S_T = _in_to_m(cfg["S_T_in"])
-    if "S_L_in" in cfg: zone.S_L = _in_to_m(cfg["S_L_in"])
-    return zone
-
-@register_zone("finned")
-def make_finned(name, cfg, model):
-    p_fin_in = 1.0 / cfg.get("fpi", 1.0)
-    return PlateFinZone(
-        name=name,
-        height=_in_to_m(_req(cfg, "width_in")),
-        width=_in_to_m(_req(cfg, "width_in")),
-        tube_dia=_in_to_m(_req(cfg, "tube_od_in")),
-        R_p=cfg.get("Rp", 2.0),
-        n_cols=int(_req(cfg, "tubes_deep")),
-        fin_pitch=_in_to_m(p_fin_in),
-        fin_thickness=_in_to_m(cfg.get("fin_thick_in", 0.012)),
-        stagger=cfg.get("stagger", True),
-        model=model,
-    )
-
-def build_hx(name, physics_model, zone_config_list, hot_inlet, cold_inlet):
-    hx = HeatExchanger(
-        name,
-        FluidStream(hot_inlet.copy()),
-        FluidStream(cold_inlet.copy()),
-    )
-
-    for i, cfg in enumerate(zone_config_list):
-        kind = cfg.get("type", "bare").lower()
-        zname = cfg.get("name", f"Zone_{i}")
-
-        try:
-            maker = _ZONE_REGISTRY[kind]
-        except KeyError:
-            raise ValueError(f"Unknown zone type '{kind}'. Valid: {sorted(_ZONE_REGISTRY)}")
-
-        hx.add_zone(maker(zname, cfg, physics_model))
-
-    return hx
+    def build(self, hot_in, cold_in):
+        hx = HeatExchanger(self.name, FluidStream(hot_in.copy()), FluidStream(cold_in.copy()))
+        for z in self.zones: hx.add_zone(z)
+        return hx
