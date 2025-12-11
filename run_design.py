@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import numpy as np
 from utils import convert as cv
 from src.fluids import FluidState, StreamType, Fluid
 from src.builders import HXBuilder
@@ -13,28 +14,30 @@ def get_design_geometry():
     
     config = [
         # Zone 1: High Temp Inlet (Bare Tubes)
-        {'type': 'bare', 'name': 'Zone 1 (Bare)', 'width': W, 'tubes_deep': 10,
+        {'type': 'bare', 'name': 'Zone 1 (Bare)', 'width': W, 'tubes_deep': 8,
          'tube_od': cv.convert(1.0, 'in', 'm'), 
          'S_T': cv.convert(2.5, 'in', 'm'), 
          'S_L': cv.convert(2.0, 'in', 'm')},
          
         # Zone 2: Main Cooling (Finned Tubes)
-        {'type': 'finned', 'name': 'Zone 2 (Finned)', 'width': W, 'tubes_deep': 20,
-         'tube_od': cv.convert(0.625, 'in', 'm'), 
+        {'type': 'finned', 'name': 'Zone 2 (Finned)', 'width': W, 'tubes_deep': 30,
+         'tube_od': cv.convert(0.75, 'in', 'm'), 
          'S_T':     cv.convert(1.5, 'in', 'm'), 
          'S_L':     cv.convert(1.25, 'in', 'm'),
-         'fin_pitch':     cv.convert(1.0/8.0, 'in', 'm'), # 8 Fins Per Inch
+         'fin_pitch':     cv.convert(1.0, 'in', 'm'), # Fins Per Inch
          'fin_thickness': cv.convert(0.012, 'in', 'm')
         }
     ]
     return config
 
-def print_dimensions(hx):
-    """Calculates and prints the physical footprint."""
-    print("\n" + "="*40)
-    print("       HEAT EXCHANGER DIMENSIONS       ")
-    print("="*40)
+def print_performance_report(hx):
+    """Calculates and prints dimensions AND performance metrics."""
+    print("\n" + "="*50)
+    print("          HEAT EXCHANGER PERFORMANCE REPORT          ")
+    print("="*50)
     
+    # --- 1. GEOMETRY ---
+    print("\n[GEOMETRY]")
     total_length = 0.0
     width = 0.0
     height = 0.0
@@ -52,16 +55,56 @@ def print_dimensions(hx):
             width = getattr(zone, 'width', 0.0)
             height = getattr(zone, 'height', 0.0)
             
-        print(f"Zone {i+1} ({zone.name}):")
-        print(f"  > Depth: {z_len:.4f} m  ({cv.convert(z_len, 'm', 'in'):.2f} in)")
+        print(f"  Zone {i+1} ({zone.name}):")
+        print(f"    > Depth: {z_len:.4f} m  ({cv.convert(z_len, 'm', 'in'):.2f} in)")
         if hasattr(zone, 'n_cols'):
-            print(f"  > Rows:  {zone.n_cols}")
+            print(f"    > Rows:  {zone.n_cols}")
 
-    print("-" * 40)
-    print(f"TOTAL DEPTH:  {total_length:.4f} m  ({cv.convert(total_length, 'm', 'in'):.2f} in)")
-    print(f"WIDTH:        {width:.4f} m  ({cv.convert(width, 'm', 'in'):.2f} in)")
-    print(f"HEIGHT:       {height:.4f} m  ({cv.convert(height, 'm', 'in'):.2f} in)")
-    print("="*40 + "\n")
+    print("-" * 30)
+    print(f"  OVERALL SIZE: {cv.convert(width, 'm', 'in'):.1f}\" (W) x {cv.convert(height, 'm', 'in'):.1f}\" (H) x {cv.convert(total_length, 'm', 'in'):.1f}\" (D)")
+
+    # --- 2. PERFORMANCE ---
+    print("\n[PERFORMANCE]")
+    
+    # Extract States
+    gas_in = hx.hot_stream.profile[0]
+    gas_out = hx.hot_stream.profile[-1]
+    cool_in = hx.cold_stream.profile[0]
+    cool_out = hx.cold_stream.profile[-1]
+    
+    # Gas Side
+    dt_gas = gas_in.T - gas_out.T
+    dp_gas = gas_in.P - gas_out.P
+    
+    print(f"  GAS SIDE ({gas_in.fluid_string}):")
+    print(f"    > Inlet T:  {cv.convert(gas_in.T, 'K', 'degC'):.1f} °C")
+    print(f"    > Outlet T: {cv.convert(gas_out.T, 'K', 'degC'):.1f} °C")
+    print(f"    > Delta T:  {dt_gas:.1f} K")
+    print(f"    > Inlet P:  {cv.convert(gas_in.P, 'Pa', 'Torr'):.1f} Torr")
+    print(f"    > Delta P:  {cv.convert(dp_gas, 'Pa', 'Torr'):.2f} Torr")
+    
+    # Coolant Side
+    # Note: For Parallel flow, dP is not P_in - P_out (which is 0 in our code).
+    # It is the average pressure drop across the parallel tubes.
+    dp_cool_total = 0.0
+    for zone in hx.zones:
+        # Sum of 'dP_cool_Pa' in zone results is currently SUM of all tubes (legacy series assumption).
+        # For Parallel, dP_zone = sum_dP / n_rows (Average drop per row).
+        # Assuming zones are in SERIES with each other.
+        if hasattr(zone, 'results') and 'dP_cool_Pa' in zone.results:
+            n_rows = zone.n_cols if hasattr(zone, 'n_cols') and zone.n_cols > 0 else 1
+            dp_zone_parallel = zone.results['dP_cool_Pa'] / n_rows
+            dp_cool_total += dp_zone_parallel
+            
+    dt_cool = cool_out.T - cool_in.T
+    
+    print(f"  COOLANT SIDE ({cool_in.fluid_string}):")
+    print(f"    > Inlet T:  {cv.convert(cool_in.T, 'K', 'degC'):.1f} °C")
+    print(f"    > Outlet T: {cv.convert(cool_out.T, 'K', 'degC'):.1f} °C")
+    print(f"    > Delta T:  {dt_cool:.1f} K")
+    print(f"    > Delta P:  {cv.convert(dp_cool_total, 'Pa', 'psi'):.2f} psi (Estimated Pump Head)")
+    
+    print("="*50 + "\n")
 
 def run_design_simulation(hot_in, cold_in, config):
     print("--- Running Design Simulation ---")
@@ -80,10 +123,10 @@ def run_design_simulation(hot_in, cold_in, config):
     # 3. Solve
     hx.solve()
     
-    # Report Dimensions
-    print_dimensions(hx)
+    # Report
+    print_performance_report(hx)
     
-    # 4. Extract Data (degC and Torr)
+    # 4. Extract Data
     rows = [0]
     temps_c = [cv.convert(hot_in.T, 'K', 'degC')]
     pressures_torr = [cv.convert(hot_in.P, 'Pa', 'Torr')]

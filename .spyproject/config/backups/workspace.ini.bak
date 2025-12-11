@@ -4,7 +4,7 @@ save_data_on_exit = True
 save_history = True
 save_non_project_files = False
 project_type = 'empty-project-type'
-recent_files = ['main_design.py', 'src\\assembly.py', 'src\\reporting\\base.py', 'src\\reporting\\results.py', 'src\\viz.py']
+recent_files = ['run_design.py', 'run_optimization.py']
 
 [main]
 version = 0.2.0
