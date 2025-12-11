@@ -1,9 +1,11 @@
 import math
+import traceback
 import CoolProp.CoolProp as cp
 from src import correlations as corr 
 from src.fluids import FluidState 
-# Default model if none provided
 from src.models import TariqModel
+from src.models.pressure import GunterShawModel
+from src.gupta import GuptaAir 
 
 class BaseZone:
     def __init__(self, name):
@@ -12,6 +14,7 @@ class BaseZone:
         self.n_tubes = 0
         self.origin_x = 0.0
         self.results = {} 
+        self.history = {}
 
     def build_geometry(self):
         raise NotImplementedError
@@ -41,38 +44,42 @@ class PipeFlowZone(BaseZone):
         mdot_g = hot_state_in.m_dot
         str_g = hot_state_in.fluid_string
         
-        rho = cp.PropsSI('D', 'T', Tg, 'P', Pg, str_g)
-        mu  = cp.PropsSI('V', 'T', Tg, 'P', Pg, str_g)
+        if Pg <= 0: raise ValueError(f"Zone {self.name}: Inlet pressure non-positive.")
+
+        if str_g == "GuptaAir":
+            rho = GuptaAir.PropsSI('D', 'T', Tg, 'P', Pg, str_g)
+            mu  = GuptaAir.PropsSI('V', 'T', Tg, 'P', Pg, str_g)
+        else:
+            rho = cp.PropsSI('D', 'T', Tg, 'P', Pg, str_g)
+            mu  = cp.PropsSI('V', 'T', Tg, 'P', Pg, str_g)
         
         u_avg = mdot_g / (rho * self.area)
         Re_D = corr.calc_Re(rho, u_avg, self.diameter, mu)
-        rel_rough = self.roughness / self.diameter
-        f = corr.calc_friction_SwameeJain(Re_D, rel_rough)
+        f = corr.calc_friction_SwameeJain(Re_D, self.roughness/self.diameter)
         dP = f * (self.length / self.diameter) * 0.5 * rho * (u_avg**2)
         
         hot_out = FluidState(hot_state_in.name, Tg, Pg - dP, mdot_g, hot_state_in.fluid_obj, x=hot_state_in.x + self.length)
         cold_out = FluidState(cold_state_in.name, cold_state_in.T, cold_state_in.P, cold_state_in.m_dot, cold_state_in.fluid_obj, x=hot_state_in.x + self.length)
         
         self.results = {
-            'Q_total_kW': 0.0,
-            'dP_gas_Pa': dP,
-            'dP_cool_Pa': 0.0,
-            'h_gas_avg': 0.0,
-            'h_cool_avg': 0.0,
-            'Re_gas_avg': Re_D,
-            'Re_cool_avg': 0.0,
-            'T_gas_out': Tg,
-            'T_cool_out': cold_state_in.T
+            'Q_total_kW': 0.0, 'dP_gas_Pa': dP, 'dP_cool_Pa': 0.0,
+            'h_gas_avg': 0.0, 'h_cool_avg': 0.0, 'Re_gas_avg': Re_D, 'Re_cool_avg': 0.0,
+            'T_gas_out': Tg, 'T_cool_out': cold_state_in.T
+        }
+        self.history = {
+            'Re_g': [Re_D], 'h_g': [0.0], 'Q': [0.0], 'dP_g': [dP], 
+            'T_wall': [cold_state_in.T], 'T_cool': [cold_state_in.T] # Dummy values for pipe
         }
         return hot_out, cold_out, [hot_out], [cold_out]
 
 # ==============================================================================
-# TUBE BANK ZONE (Bare Tubes)
+# TUBE BANK ZONE
 # ==============================================================================
 class TubeBankZone(BaseZone):
     def __init__(self, name, height, tube_dia, R_p, n_cols, width=0.4064, 
                  origin_x=0.0, origin_y=0.0, stagger=True,
-                 t_w=0.000889, k_wall=16.2, e_roughness=15e-6, model=None): 
+                 t_w=0.000889, k_wall=16.2, e_roughness=15e-6, 
+                 model=None, pressure_model=None): 
         super().__init__(name)
         self.height = float(height)
         self.width  = float(width) 
@@ -82,9 +89,11 @@ class TubeBankZone(BaseZone):
         self.origin_x = float(origin_x)
         self.origin_y = float(origin_y)
         self.stagger = bool(stagger)
+        
         self.model = model if model else TariqModel()
+        self.pressure_model = pressure_model if pressure_model else GunterShawModel(use_correction=True)
+        
         self.t_w, self.k_wall, self.e_roughness = t_w, k_wall, e_roughness
-
         self.D_t_inner = self.tube_dia - 2.0 * self.t_w
         self.S_T = self.R_p * self.tube_dia
         self.S_L = self.R_p * self.tube_dia 
@@ -127,8 +136,8 @@ class TubeBankZone(BaseZone):
         hot_profile, cold_profile = [], []
         stats_Q, stats_h_g, stats_h_c = [], [], []
         stats_Re_g, stats_Re_c, stats_dP_g, stats_dP_c = [], [], [], []
+        stats_Tw, stats_Tc = [], [] # New Arrays
 
-        # Geometry
         L_tubes = self.width 
         dx = self.S_L 
         A_front = self.height * L_tubes
@@ -137,29 +146,49 @@ class TubeBankZone(BaseZone):
         A_surf_tube = self.n_rows_avg * math.pi * self.tube_dia * L_tubes
         A_surf_cool = self.n_rows_avg * math.pi * self.D_t_inner * L_tubes
         A_c_cross = math.pi * (self.D_t_inner**2) / 4.0
-        mdot_per_tube = mdot_c / (self.n_rows_avg if self.n_rows_avg > 0 else 1)
+        
+        n_total_tubes = self.n_rows_avg * self.n_cols
+        if n_total_tubes == 0: n_total_tubes = 1
+        mdot_per_tube = mdot_c / n_total_tubes
 
-        # MARCHING LOOP
         for i in range(self.n_cols):
             x_loc = self.origin_x + (i + 1) * dx
             
-            # 1. Properties
+            if Pg <= 0:
+                print(f"  [FAILURE] Gas Pressure Exhausted at Row {i} ({Pg:.2f} Pa)")
+                break
+            if Pc <= 0:
+                print(f"  [FAILURE] Coolant Pressure Exhausted at Row {i} ({Pc:.2f} Pa)")
+                break
+
             try:
-                rho_g = cp.PropsSI('D', 'T', Tg, 'P', Pg, str_g)
-                mu_g  = cp.PropsSI('V', 'T', Tg, 'P', Pg, str_g)
-                cp_g  = cp.PropsSI('C', 'T', Tg, 'P', Pg, str_g)
-                k_g   = cp.PropsSI('L', 'T', Tg, 'P', Pg, str_g)
-                pr_g  = cp.PropsSI('Prandtl', 'T', Tg, 'P', Pg, str_g)
-                M_g   = cp.PropsSI('M', str_g)
+                if str_g == "GuptaAir":
+                    rho_g = GuptaAir.PropsSI('D', 'T', Tg, 'P', Pg, str_g)
+                    mu_g  = GuptaAir.PropsSI('V', 'T', Tg, 'P', Pg, str_g)
+                    cp_g  = GuptaAir.PropsSI('C', 'T', Tg, 'P', Pg, str_g)
+                    k_g   = GuptaAir.PropsSI('L', 'T', Tg, 'P', Pg, str_g)
+                    pr_g  = GuptaAir.PropsSI('Prandtl', 'T', Tg, 'P', Pg, str_g)
+                    M_g   = GuptaAir.PropsSI('M', 'T', Tg, 'P', Pg, str_g)
+                    mu_w  = GuptaAir.PropsSI('V', 'T', Tc, 'P', Pg, str_g)
+                else:
+                    rho_g = cp.PropsSI('D', 'T', Tg, 'P', Pg, str_g)
+                    mu_g  = cp.PropsSI('V', 'T', Tg, 'P', Pg, str_g)
+                    cp_g  = cp.PropsSI('C', 'T', Tg, 'P', Pg, str_g)
+                    k_g   = cp.PropsSI('L', 'T', Tg, 'P', Pg, str_g)
+                    pr_g  = cp.PropsSI('Prandtl', 'T', Tg, 'P', Pg, str_g)
+                    M_g   = cp.PropsSI('M', str_g)
+                    mu_w  = cp.PropsSI('V', 'T', Tc, 'P', Pg, str_g)
                 
                 rho_c = cp.PropsSI('D', 'T', Tc, 'P', Pc, str_c)
                 mu_c  = cp.PropsSI('V', 'T', Tc, 'P', Pc, str_c)
                 cp_c  = cp.PropsSI('C', 'T', Tc, 'P', Pc, str_c)
                 k_c   = cp.PropsSI('L', 'T', Tc, 'P', Pc, str_c)
                 pr_c  = cp.PropsSI('Prandtl', 'T', Tc, 'P', Pc, str_c)
-            except ValueError: break
+            except ValueError as e:
+                print(f"  [FAILURE] Property Error at Row {i}: {e}")
+                break
 
-            # 2. Gas Physics
+            # 2. Physics
             if hasattr(self.model, 'calculate_Re_max'):
                 Re_t = self.model.calculate_Re_max(rho_g, mdot_g, A_front, self.S_T, self.S_L, self.tube_dia, mu_g)
                 u_max = (Re_t * mu_g) / (rho_g * self.tube_dia) if rho_g > 0 else 0.0
@@ -172,50 +201,55 @@ class TubeBankZone(BaseZone):
                 'D': self.tube_dia, 'S_T': self.S_T, 'S_L': self.S_L,
                 'N_rows': self.n_cols, 'Pr_wall': pr_g, 'T_wall': Tc, 'T_cool': Tc
             }
-            
             Nu_t = self.model.calculate_Nu(Re_t, pr_g, **model_params)
             h_t = Nu_t * k_g / self.tube_dia
             
-            Eu_row = corr.calc_Eu_HEDH(Re_t, self.R_p)
-            dP_g_col = corr.calc_dP_gas_column(Eu_row, rho_g, u_max, self.n_rows_avg)
+            dP_params = {
+                'rho': rho_g, 'mu': mu_g, 'mu_wall': mu_w, 'm_dot': mdot_g,
+                'S_T': self.S_T, 'S_L': self.S_L, 'D': self.tube_dia,
+                'L_flow': self.S_L, 'A_front': A_front
+            }
+            dP_g_col = self.pressure_model.calculate_dP(**dP_params)
             
-            # 3. Coolant Physics
             u_c = mdot_per_tube / (rho_c * A_c_cross)
             Re_h = corr.calc_Re(rho_c, u_c, self.D_t_inner, mu_c)
             f_cool = corr.calc_friction_SwameeJain(Re_h, self.e_roughness/self.D_t_inner)
             Nu_h   = corr.calc_Nu_Gnielinski(Re_h, pr_c, f_cool, self.D_t_inner, L_tubes)
             h_c    = Nu_h * k_c / self.D_t_inner
-            dP_c_col = corr.calc_dP_coolant_tube(f_cool, rho_c, u_c, self.D_t_inner, L_tubes / self.n_cols)
+            dP_c_col = corr.calc_dP_coolant_tube(f_cool, rho_c, u_c, self.D_t_inner, L_tubes)
 
-            # 4. Energy Balance (e-NTU)
+            # 5. Energy Balance
             R_gas  = 1.0 / (h_t * A_surf_tube)
             R_cool = 1.0 / (h_c * A_surf_cool)
             R_wall = math.log(self.tube_dia/self.D_t_inner) / (2*math.pi*self.k_wall*L_tubes * self.n_rows_avg)
             UA_total = 1.0 / (R_gas + R_cool + R_wall)
             
-            C_g = mdot_g * cp_g
-            C_c = mdot_c * cp_c
+            C_g, C_c = mdot_g * cp_g, mdot_c * cp_c
             C_min = min(C_g, C_c)
             
             NTU = UA_total / C_min
             eps = 1.0 - math.exp(-NTU)
             Q = eps * C_min * (Tg - Tc)
             
+            # --- CALCULATE T_WALL (Intermediate) ---
+            # Q = (Tg - Tw_out) / R_gas => Tw_out = Tg - Q*R_gas
+            T_wall_outer = Tg - Q * R_gas
+            # Or average wall temp: T_wall ~ Tc + Q * (R_cool + 0.5*R_wall)
+            T_wall_avg = Tc + Q * (R_cool + 0.5 * R_wall)
+            
             Tg -= Q / C_g
             Tc += Q / C_c
             Pg -= dP_g_col
-            Pc -= dP_c_col 
             
             hot_profile.append(FluidState(hot_state_in.name, Tg, Pg, mdot_g, hot_state_in.fluid_obj, x=x_loc))
             cold_profile.append(FluidState(cold_state_in.name, Tc, Pc, mdot_c, cold_state_in.fluid_obj, x=x_loc))
             
             stats_Q.append(Q)
-            stats_h_g.append(h_t)
-            stats_h_c.append(h_c)
-            stats_Re_g.append(Re_t)
-            stats_Re_c.append(Re_h)
-            stats_dP_g.append(dP_g_col)
-            stats_dP_c.append(dP_c_col)
+            stats_h_g.append(h_t); stats_h_c.append(h_c); stats_Re_g.append(Re_t); stats_Re_c.append(Re_h)
+            stats_dP_g.append(dP_g_col); stats_dP_c.append(dP_c_col)
+            # Store Temps
+            stats_Tw.append(T_wall_avg)
+            stats_Tc.append(Tc)
 
         if not stats_Q: return hot_state_in, cold_state_in, [], []
         
@@ -227,8 +261,13 @@ class TubeBankZone(BaseZone):
             'h_cool_avg': sum(stats_h_c) / len(stats_h_c),
             'Re_gas_avg': sum(stats_Re_g) / len(stats_Re_g),
             'Re_cool_avg': sum(stats_Re_c) / len(stats_Re_c),
-            'T_gas_out': Tg,
-            'T_cool_out': Tc
+            'T_gas_out': Tg, 'T_cool_out': Tc
+        }
+        # Updated History with Wall and Coolant Temps
+        self.history = {
+            'Re_g': stats_Re_g, 'h_g': stats_h_g, 'Q': stats_Q, 
+            'dP_g': stats_dP_g, 'Re_c': stats_Re_c,
+            'T_wall': stats_Tw, 'T_cool': stats_Tc
         }
         return hot_profile[-1], cold_profile[-1], hot_profile, cold_profile
 
@@ -238,9 +277,10 @@ class TubeBankZone(BaseZone):
 class PlateFinZone(TubeBankZone):
     def __init__(self, name, height, tube_dia, R_p, n_cols, fin_pitch, fin_thickness, 
                  width=0.4064, origin_x=0.0, origin_y=0.0, stagger=True,
-                 t_w=0.000889, k_wall=16.2, e_roughness=15e-6, model=None): 
+                 t_w=0.000889, k_wall=16.2, e_roughness=15e-6, 
+                 model=None, pressure_model=None): 
         super().__init__(name, height, tube_dia, R_p, n_cols, width, 
-                         origin_x, origin_y, stagger, t_w, k_wall, e_roughness, model)
+                         origin_x, origin_y, stagger, t_w, k_wall, e_roughness, model, pressure_model)
         self.fin_pitch = float(fin_pitch)
         self.fin_thickness = float(fin_thickness)
         self.fin_gap = self.fin_pitch - self.fin_thickness
@@ -257,8 +297,8 @@ class PlateFinZone(TubeBankZone):
         hot_profile, cold_profile = [], []
         stats_Q, stats_h_g, stats_h_c = [], [], []
         stats_Re_g, stats_Re_c, stats_dP_g, stats_dP_c = [], [], [], []
+        stats_Tw, stats_Tc = [], []
 
-        # Geometry
         L_tubes = self.width 
         dx = self.S_L 
         N_fins = math.floor(L_tubes / self.fin_pitch)
@@ -273,28 +313,48 @@ class PlateFinZone(TubeBankZone):
         A_fin_surf = 2.0 * N_fins * A_fin_face
         A_cool_surf = self.n_rows_avg * math.pi * self.D_t_inner * L_tubes
         A_c_cross = math.pi * (self.D_t_inner**2) / 4.0
-        mdot_per_tube = mdot_c / (self.n_rows_avg if self.n_rows_avg > 0 else 1)
+        
+        n_total_tubes = self.n_rows_avg * self.n_cols
+        if n_total_tubes == 0: n_total_tubes = 1
+        mdot_per_tube = mdot_c / n_total_tubes
 
         for i in range(self.n_cols):
             x_loc = self.origin_x + (i + 1) * dx
-            x_local = (i + 0.5) * dx 
             
+            if Pg <= 0:
+                print(f"  [FAILURE] Gas Pressure Exhausted at Row {i} ({Pg:.2f} Pa)")
+                break
+            if Pc <= 0:
+                print(f"  [FAILURE] Coolant Pressure Exhausted at Row {i} ({Pc:.2f} Pa)")
+                break
+
             try:
-                rho_g = cp.PropsSI('D', 'T', Tg, 'P', Pg, str_g)
-                mu_g  = cp.PropsSI('V', 'T', Tg, 'P', Pg, str_g)
-                cp_g  = cp.PropsSI('C', 'T', Tg, 'P', Pg, str_g)
-                k_g   = cp.PropsSI('L', 'T', Tg, 'P', Pg, str_g)
-                pr_g  = cp.PropsSI('Prandtl', 'T', Tg, 'P', Pg, str_g)
-                M_g   = cp.PropsSI('M', str_g)
+                if str_g == "GuptaAir":
+                    rho_g = GuptaAir.PropsSI('D', 'T', Tg, 'P', Pg, str_g)
+                    mu_g  = GuptaAir.PropsSI('V', 'T', Tg, 'P', Pg, str_g)
+                    cp_g  = GuptaAir.PropsSI('C', 'T', Tg, 'P', Pg, str_g)
+                    k_g   = GuptaAir.PropsSI('L', 'T', Tg, 'P', Pg, str_g)
+                    pr_g  = GuptaAir.PropsSI('Prandtl', 'T', Tg, 'P', Pg, str_g)
+                    M_g   = GuptaAir.PropsSI('M', 'T', Tg, 'P', Pg, str_g)
+                    mu_w  = GuptaAir.PropsSI('V', 'T', Tc, 'P', Pg, str_g)
+                else:
+                    rho_g = cp.PropsSI('D', 'T', Tg, 'P', Pg, str_g)
+                    mu_g  = cp.PropsSI('V', 'T', Tg, 'P', Pg, str_g)
+                    cp_g  = cp.PropsSI('C', 'T', Tg, 'P', Pg, str_g)
+                    k_g   = cp.PropsSI('L', 'T', Tg, 'P', Pg, str_g)
+                    pr_g  = cp.PropsSI('Prandtl', 'T', Tg, 'P', Pg, str_g)
+                    M_g   = cp.PropsSI('M', str_g)
+                    mu_w  = cp.PropsSI('V', 'T', Tc, 'P', Pg, str_g)
                 
                 rho_c = cp.PropsSI('D', 'T', Tc, 'P', Pc, str_c)
                 mu_c  = cp.PropsSI('V', 'T', Tc, 'P', Pc, str_c)
                 cp_c  = cp.PropsSI('C', 'T', Tc, 'P', Pc, str_c)
                 k_c   = cp.PropsSI('L', 'T', Tc, 'P', Pc, str_c)
                 pr_c  = cp.PropsSI('Prandtl', 'T', Tc, 'P', Pc, str_c)
-            except ValueError: break
+            except ValueError as e:
+                print(f"  [FAILURE] Property Error at Row {i}: {e}")
+                break
 
-            # A. TUBE PHYSICS
             if hasattr(self.model, 'calculate_Re_max'):
                 Re_t = self.model.calculate_Re_max(rho_g, mdot_g, A_front * fin_blockage, self.S_T, self.S_L, self.tube_dia, mu_g)
             else:
@@ -306,67 +366,64 @@ class PlateFinZone(TubeBankZone):
                 'D': self.tube_dia, 'S_T': self.S_T, 'S_L': self.S_L,
                 'N_rows': self.n_cols, 'Pr_wall': pr_g, 'T_wall': Tc, 'T_cool': Tc
             }
-            
             Nu_t = self.model.calculate_Nu(Re_t, pr_g, **model_params)
             h_tube = Nu_t * k_g / self.tube_dia
             
-            # B. FIN PHYSICS
+            # Fin Physics
             A_fin_channel = A_front * fin_blockage
             u_fin = mdot_g / (rho_g * A_fin_channel)
             x_entry = corr.calc_entry_length_laminar(rho_g, u_fin, mu_g, pr_g, self.D_h)
             
-            if x_local < x_entry:
-                Re_x = corr.calc_Re(rho_g, u_fin, x_local, mu_g)
+            if 0.5 * dx < x_entry: 
+                Re_x = corr.calc_Re(rho_g, u_fin, 0.5*dx, mu_g)
                 Nu_fin = corr.calc_Nu_FlatPlate_Laminar(Re_x, pr_g)
-                h_fin = Nu_fin * k_g / x_local
+                h_fin = Nu_fin * k_g / (0.5*dx)
             else:
                 Nu_fin = corr.calc_Nu_Duct_Laminar()
                 h_fin = Nu_fin * k_g / self.D_h
                 
-            # C. COMBINED
             UA_gas_col = (h_tube * A_tube_surf) + (h_fin * A_fin_surf)
             h_effective = UA_gas_col / (A_tube_surf + A_fin_surf)
 
-            # D. COOLANT
+            dP_params = {
+                'rho': rho_g, 'mu': mu_g, 'mu_wall': mu_w, 'm_dot': mdot_g,
+                'S_T': self.S_T, 'S_L': self.S_L, 'D': self.tube_dia,
+                'L_flow': self.S_L, 'A_front': A_front
+            }
+            dP_g_col = self.pressure_model.calculate_dP(**dP_params)
+
             u_c = mdot_per_tube / (rho_c * A_c_cross)
             Re_h = corr.calc_Re(rho_c, u_c, self.D_t_inner, mu_c)
             f_cool = corr.calc_friction_SwameeJain(Re_h, self.e_roughness/self.D_t_inner)
             Nu_h   = corr.calc_Nu_Gnielinski(Re_h, pr_c, f_cool, self.D_t_inner, L_tubes)
             h_c    = Nu_h * k_c / self.D_t_inner
-            dP_c_col = corr.calc_dP_coolant_tube(f_cool, rho_c, u_c, self.D_t_inner, L_tubes / self.n_cols)
+            dP_c_col = corr.calc_dP_coolant_tube(f_cool, rho_c, u_c, self.D_t_inner, L_tubes)
             
-            Eu_row = corr.calc_Eu_HEDH(Re_t, self.R_p)
-            dP_g_col = corr.calc_dP_gas_column(Eu_row, rho_g, mdot_g/(rho_g*A_min_flow), self.n_rows_avg)
-
-            # E. ENERGY BALANCE (e-NTU)
             R_gas  = 1.0 / UA_gas_col
             R_cool = 1.0 / (h_c * A_cool_surf)
             R_wall = math.log(self.tube_dia/self.D_t_inner) / (2*math.pi*self.k_wall*L_tubes * self.n_rows_avg)
             UA_total = 1.0 / (R_gas + R_cool + R_wall)
             
-            C_g = mdot_g * cp_g
-            C_c = mdot_c * cp_c
+            C_g, C_c = mdot_g * cp_g, mdot_c * cp_c
             C_min = min(C_g, C_c)
             
             NTU = UA_total / C_min
             eps = 1.0 - math.exp(-NTU)
             Q = eps * C_min * (Tg - Tc)
             
+            T_wall_avg = Tc + Q * (R_cool + 0.5 * R_wall)
+
             Tg -= Q / C_g
             Tc += Q / C_c
             Pg -= dP_g_col
-            Pc -= dP_c_col 
             
             hot_profile.append(FluidState(hot_state_in.name, Tg, Pg, mdot_g, hot_state_in.fluid_obj, x=x_loc))
             cold_profile.append(FluidState(cold_state_in.name, Tc, Pc, mdot_c, cold_state_in.fluid_obj, x=x_loc))
             
             stats_Q.append(Q)
-            stats_h_g.append(h_effective)
-            stats_h_c.append(h_c)
-            stats_Re_g.append(Re_t) # <--- ADDED MISSING APPEND
-            stats_Re_c.append(Re_h) # <--- ADDED MISSING APPEND
-            stats_dP_g.append(dP_g_col)
-            stats_dP_c.append(dP_c_col)
+            stats_h_g.append(h_effective); stats_h_c.append(h_c); stats_Re_g.append(Re_t); stats_Re_c.append(Re_h)
+            stats_dP_g.append(dP_g_col); stats_dP_c.append(dP_c_col)
+            stats_Tw.append(T_wall_avg); stats_Tc.append(Tc)
 
         if not stats_Q: return hot_state_in, cold_state_in, [], []
 
@@ -378,7 +435,11 @@ class PlateFinZone(TubeBankZone):
             'h_cool_avg': sum(stats_h_c) / len(stats_h_c),
             'Re_gas_avg': sum(stats_Re_g) / len(stats_Re_g),
             'Re_cool_avg': sum(stats_Re_c) / len(stats_Re_c),
-            'T_gas_out': Tg,
-            'T_cool_out': Tc
+            'T_gas_out': Tg, 'T_cool_out': Tc
+        }
+        self.history = {
+            'Re_g': stats_Re_g, 'h_g': stats_h_g, 'Q': stats_Q, 
+            'dP_g': stats_dP_g, 'Re_c': stats_Re_c,
+            'T_wall': stats_Tw, 'T_cool': stats_Tc
         }
         return hot_profile[-1], cold_profile[-1], hot_profile, cold_profile

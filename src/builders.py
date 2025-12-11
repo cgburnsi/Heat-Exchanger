@@ -1,18 +1,17 @@
-# src/builders.py
 from src.assembly import HeatExchanger
 from src.zones import PipeFlowZone, PlateFinZone, TubeBankZone
 from src.fluids import FluidStream
+from src.models.pressure import GunterShawModel
 
 class HXBuilder:
     """
     Production Builder: Converts configuration dictionaries into a HeatExchanger assembly.
-    
-    IMPORTANT: This builder assumes ALL geometry values in the config dictionaries
-    are already converted to Base Units (Meters) before being passed in.
     """
-    def __init__(self, name, physics_model):
+    def __init__(self, name, physics_model, pressure_model=None):
         self.name = name
         self.model = physics_model
+        # Use provided pressure model, or default to Uncorrected Gunter-Shaw to prevent crashing
+        self.pressure_model = pressure_model if pressure_model else GunterShawModel(use_correction=False)
         self.zones = []
         
         self._creators = {
@@ -34,7 +33,6 @@ class HXBuilder:
         return self
 
     def _add_pipe(self, name, cfg):
-        # Expects: 'length', 'diameter' (in meters)
         self.zones.append(PipeFlowZone(
             name,
             length=cfg['length'],
@@ -43,29 +41,23 @@ class HXBuilder:
         ))
 
     def _add_bare(self, name, cfg):
-        # Expects: 'width', 'height', 'tube_od' (in meters)
         zone = TubeBankZone(
             name=name,
-            height=cfg.get('height', cfg['width']), # Default to square if height missing
+            height=cfg.get('height', cfg['width']),
             width=cfg['width'],
             tube_dia=cfg['tube_od'],
             R_p=cfg.get('Rp', 1.5),
             n_cols=int(cfg['tubes_deep']),
             stagger=cfg.get('stagger', True),
-            model=self.model
+            model=self.model,
+            pressure_model=self.pressure_model # <--- INJECTED HERE
         )
-        # Explicit Geometry Overrides (in meters)
         if 'S_T' in cfg: zone.S_T = cfg['S_T']
         if 'S_L' in cfg: zone.S_L = cfg['S_L']
-        
         self.zones.append(zone)
 
     def _add_finned(self, name, cfg):
-        # Expects: 'fin_pitch', 'fin_thickness' (in meters)
-        
-        # Helper: Calculate height from width if not provided (Square Duct assumption)
         height = cfg.get('height', cfg['width'])
-        
         self.zones.append(PlateFinZone(
             name=name,
             height=height,
@@ -76,7 +68,8 @@ class HXBuilder:
             fin_pitch=cfg['fin_pitch'],
             fin_thickness=cfg['fin_thickness'],
             stagger=cfg.get('stagger', True),
-            model=self.model
+            model=self.model,
+            pressure_model=self.pressure_model # <--- INJECTED HERE
         ))
 
     def build(self, hot_in, cold_in):

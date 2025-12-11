@@ -1,54 +1,75 @@
 import math
-
+import logging
 # Safe import for script/module usage
 try:
-    # When running as part of the src package
     from .grimison import GrimisonModel
 except ImportError:
-    # When running this file directly
     from grimison import GrimisonModel
+
+logger = logging.getLogger(__name__)
 
 class ModifiedGrimisonModel(GrimisonModel):
     """
     Modified Grimison Correlation (Hammock).
     
-    Inherits geometry coefficients (C1, m) and row corrections (C2) 
-    from the standard Grimison model, but applies a correction factor (Xi_H)
-    to account for large property variations in high-enthalpy flows.
-    
-    Nu = C2 * C1 * Re^m * Pr^(1/3) * Xi_H
+    Reference: Eq 16 & 17 in 'Cross-Flow Staggered-Tube Heat Exchanger Analysis'
+    Nu = 1.13 * Xi_H * C1 * C2 * Re^m * Pr^(1/3)
     """
 
-    def _calculate_xi(self, T_gas, T_wall):
+    def _calculate_xi_hammock(self, Re, Pr, N_L=1):
         """
-        Calculates the Property Variation Correction Factor (Xi_H).
-        Standard correction: Xi = (T_gas / T_wall) ^ n
+        Calculates the High-Enthalpy Correction Factor (Xi_H).
+        Source: Equation 17 
+        
+        Note: The paper states "since the numerical model calculates the heat 
+        transfer by discrete rows, N_L = 1 for each row".
         """
-        if T_wall <= 0 or T_gas <= 0: return 1.0
+        if Re <= 0: return 1.0
         
-        # Ratio of Bulk Temp to Wall Temp (in Kelvin)
-        T_ratio = T_gas / T_wall
+        # Term 1: Sqrt(N_L)
+        term_rows = math.sqrt(N_L)
         
-        # EXPONENT 'n' (Hammock/Zukauskas standard for gas cooling)
-        n = 0.25 
+        # Term 2: Re / 2000
+        term_re = Re / 2000.0
         
-        return T_ratio ** n
+        # Term 3: (Pr / 0.71)^(1/3)
+        # 0.71 is the reference Prandtl number for air
+        term_pr = (Pr / 0.71)**(1.0/3.0)
+        
+        # Combine arguments for Tanh
+        arg = term_rows * term_re * term_pr
+        
+        # Xi_H = [ tanh( arg ) ] ^ (1/3)
+        xi = math.tanh(arg)**(1.0/3.0)
+        
+        return xi
 
     def calculate_Nu(self, Re, Pr, **kwargs):
         """
-        Calculates Nu using Grimison tables + Xi_H correction.
+        Calculates Nu using Grimison coefficients + Hammock's Xi_H correction.
         """
-        # 1. Calculate Base Grimison Nu (C1 * C2 * Re^m * Pr^1/3)
-        # We call the parent class method
-        Nu_base = super().calculate_Nu(Re, Pr, **kwargs)
+        # 1. Get Base Grimison Nu (Using parent class logic)
+        # Note: Parent calculates C2 * C1 * Re^m * Pr^(1/3)
+        # We temporarily divide out the 1.13 factor if parent adds it, 
+        # but your GrimisonModel likely doesn't have the 1.13 leading coeff?
+        # WAIT: Eq 13 in paper says Nu = 1.13 * C1 * ... [cite: 204]
+        # Your current GrimisonModel likely implements the standard Nu = C1...
+        # We will apply the 1.13 factor here explicitly.
         
-        # 2. Extract Temperatures for Correction
-        T_gas = kwargs.get('T')
+        # Get raw coeffs from parent logic to be safe
+        S_T, S_L, D = kwargs['S_T'], kwargs['S_L'], kwargs['D']
+        N_rows = kwargs.get('N_rows', 1)
         
-        # Look for 'T_wall' (explicit) or 'T_cool' (proxy), default to T_gas
-        T_wall = kwargs.get('T_wall', kwargs.get('T_cool', T_gas))
+        # Use Hammock Polynomials (Eq 14/15 equivalent in your code)
+        C1, m = self._get_coeffs_hammock(S_T, S_L, D)
+        C2 = self._get_c2_factor(N_rows)
         
-        # 3. Calculate Correction Factor Xi_H
-        xi_h = self._calculate_xi(T_gas, T_wall)
+        # 2. Calculate Correction Factor Xi_H (Eq 17)
+        # Paper says use N_L=1 for row-by-row 
+        xi_h = self._calculate_xi_hammock(Re, Pr, N_L=1)
         
-        return Nu_base * xi_h
+        # 3. Final Calculation (Eq 16) 
+        # Nu = 1.13 * Xi_H * C1 * C2 * Re^m * Pr^(1/3)
+        Nu = 1.13 * xi_h * C1 * C2 * (Re**m) * (Pr**(1.0/3.0))
+        
+        return Nu

@@ -1,13 +1,10 @@
 from .base import HeatTransferModel
 from .grimison import GrimisonModel
-from .modified_grimison import ModifiedGrimisonModel # <--- NEW
+from .modified_grimison import ModifiedGrimisonModel
 from .tariq import TariqModel
-#from .zukauskas import ZukauskasModel
+from .zhukauskas import ZhukauskasModel # <--- Ensure this is here
 
 __all__ = [
-    'HeatTransferModel',
-    'GrimisonModel',
-    'ModifiedGrimisonModel',
-    'TariqModel',
-#    'ZukauskasModel'
+    'HeatTransferModel', 'GrimisonModel', 
+    'ModifiedGrimisonModel', 'TariqModel', 'ZhukauskasModel'
 ]

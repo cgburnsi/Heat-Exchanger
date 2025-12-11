@@ -15,6 +15,7 @@ class Fluid(str, Enum):
     O2      = 'Oxygen'
     WATER   = 'Water'
     NITROGEN = 'Nitrogen'
+    AIR     = 'Air'
     
 class FluidState:
     ''' Thermodynamic State for a Single Stream (Gas or Coolant).

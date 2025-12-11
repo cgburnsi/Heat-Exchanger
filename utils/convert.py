@@ -260,6 +260,7 @@ UNITS = {
 
     # Miscellaneous units
     'Torr': UnitDefinition('Torr', 'Torr', M=1, L=-1, T=-2, coef=133.322),
+    'psia':     UnitDefinition('psi', 'psi', M=1, L=-1, T=-2, coef=6894.76),
     'bar': UnitDefinition('bar', 'bar', M=1, L=-1, T=-2, coef=1E5),
     'min': UnitDefinition('min', 'minute', T=1, coef=60),
     'h': UnitDefinition('h', 'hour', T=1, coef=3600),
